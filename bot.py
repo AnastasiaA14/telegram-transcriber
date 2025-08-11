@@ -1,108 +1,90 @@
 import os
-import logging
 import requests
 import tempfile
 import subprocess
-from telegram.ext import Application, MessageHandler, filters
+import logging
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# Настройка логов
+logging.basicConfig(
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    level=logging.INFO
+)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-FFMPEG_BIN = "ffmpeg"
+# Папка для временных файлов
+TEMP_DIR = tempfile.gettempdir()
 
-def transcribe_deepgram(audio_path):
+# Функция извлечения аудио из видео
+def extract_audio(input_path, output_path):
+    cmd = [
+        "ffmpeg", "-i", input_path,
+        "-ar", "16000", "-ac", "1", "-f", "wav",
+        output_path
+    ]
+    subprocess.run(cmd, check=True)
+
+# Функция распознавания через Deepgram (без model/tier для бесплатного плана)
+def transcribe_deepgram(file_path):
     url = "https://api.deepgram.com/v1/listen"
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
         "Content-Type": "audio/wav"
     }
     params = {
-        "model": "nova-2",
-        "language": "ru",
         "smart_format": "true",
-        "tier": "enhanced",
-        "diarize": "true",
-        "utterances": "true",
-        "profanity_filter": "false"
+        "punctuate": "true",
+        "paragraphs": "true",
+        "diarize": "true" if os.getenv("ASR_DIARIZE", "false").lower() in ("1","true","yes") else "false",
+        "language": "ru"
     }
 
-    with open(audio_path, "rb") as f:
+    with open(file_path, "rb") as f:
         r = requests.post(url, headers=headers, params=params, data=f)
 
     if r.status_code != 200:
-        raise RuntimeError(f"Deepgram вернул ошибку {r.status_code}:\n{r.text}")
+        msg = r.text
+        raise RuntimeError(f"Deepgram вернул ошибку {r.status_code}:\n{msg}")
 
-    data = r.json()
-    try:
-        text = data["results"]["channels"][0]["alternatives"][0]["transcript"]
-        return text.strip() if text else ""
-    except KeyError:
-        return ""
+    result = r.json()
+    return result["results"]["channels"][0]["alternatives"][0]["transcript"]
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    file_id = None
-    if update.message.audio:
-        file_id = update.message.audio.file_id
-    elif update.message.voice:
-        file_id = update.message.voice.file_id
-    elif update.message.video:
-        file_id = update.message.video.file_id
-    elif update.message.document:
-        file_id = update.message.document.file_id
-
-    if not file_id:
-        await update.message.reply_text("Отправьте аудио, видео или документ с медиа.")
+# Обработчик медиа
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.effective_attachment:
         return
 
-    file = await context.bot.get_file(file_id)
+    file = await update.message.effective_attachment.get_file()
+    temp_input = os.path.join(TEMP_DIR, file.file_id)
+    temp_wav = temp_input + ".wav"
 
-    await update.message.reply_text("📥 Скачиваю файл...")
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_in:
-        await file.download_to_drive(tmp_in.name)
-        in_path = tmp_in.name
+    await file.download_to_drive(temp_input)
 
-    if os.path.getsize(in_path) < 10_000:
-        await update.message.reply_text("❌ Ошибка: Файл слишком маленький или не докачался (< 10 КБ).")
-        os.remove(in_path)
-        return
-
-    wav_path = tempfile.mktemp(suffix=".wav")
-    await update.message.reply_text("🎙 Конвертирую в WAV...")
     try:
-        subprocess.run([FFMPEG_BIN, "-i", in_path, "-ar", "16000", "-ac", "1", wav_path], check=True)
-    except subprocess.CalledProcessError:
-        await update.message.reply_text("❌ Ошибка при конвертации файла.")
-        os.remove(in_path)
-        return
-
-    await update.message.reply_text("🤖 Распознаю речь (Deepgram)...")
-    try:
-        text = transcribe_deepgram(wav_path)
-    except RuntimeError as e:
+        extract_audio(temp_input, temp_wav)
+        text = transcribe_deepgram(temp_wav)
+        await update.message.reply_text(text)
+    except Exception as e:
         await update.message.reply_text(f"❌ Ошибка распознавания: {e}")
-        os.remove(in_path)
-        os.remove(wav_path)
-        return
+    finally:
+        for path in (temp_input, temp_wav):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
-    os.remove(in_path)
-    os.remove(wav_path)
-
-    if text:
-        await update.message.reply_text(f"✅ Распознанный текст:\n\n{text}")
-    else:
-        await update.message.reply_text("⚠️ Файл распознан, но текст пуст. Возможно, речь была слишком тихой или непонятной.")
-
+# Запуск бота
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
-        raise ValueError("❌ Не задан TELEGRAM_TOKEN")
+        logging.error("Не указан TELEGRAM_TOKEN")
+        exit(1)
     if not DEEPGRAM_API_KEY:
-        raise ValueError("❌ Не задан DEEPGRAM_API_KEY")
+        logging.error("Не указан DEEPGRAM_API_KEY")
+        exit(1)
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.ALL, handle_message))
-    logging.info("Бот запущен...")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_media))
     app.run_polling()
