@@ -1,20 +1,20 @@
 [phases.setup]
-# Ставим полную сборку Python (включает ensurepip) и ffmpeg
-nixPkgs = ["python311Full", "ffmpeg"]
+# Ставим Python, сам pip как пакет и ffmpeg
+nixPkgs = ["python311", "python311Packages.pip", "ffmpeg"]
 
 [phases.install]
-# Явно разворачиваем pip и ставим зависимости
+# Используем pip из Python — так надёжнее на Nix
 cmds = [
-  "python -m ensurepip --upgrade",
-  "python -m pip install --upgrade pip",
-  "python -m pip install --no-cache-dir -r requirements.txt"
+  "python3 -m pip install --upgrade pip",
+  "python3 -m pip install --no-cache-dir -r requirements.txt"
 ]
 
 [start]
-# Если у тебя запускается bot.py — оставь так:
-cmd = "python bot.py"
-# Если запускаешь облачную версию — поменяй на:
-# cmd = "python bot_cloud.py"
+# Если запускаешь локальную версию — оставь bot.py
+# cmd = "python bot.py"
+
+# Если запускаешь облачную быструю версию (Deepgram) — раскомментируй эту строку:
+cmd = "python bot_cloud.py"
 
 
 
