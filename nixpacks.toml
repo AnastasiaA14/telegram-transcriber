@@ -1,9 +1,13 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "python311"]
+# Явно ставим Python и ffmpeg
+nixPkgs = ["python311", "ffmpeg"]
 
 [phases.install]
-cmds = ["pip install --no-cache-dir -r requirements.txt"]
+# Важно: вызываем pip через python, тогда он точно найдётся
+cmds = ["python -m pip install --no-cache-dir -r requirements.txt"]
 
 [start]
-cmd = "python bot_cloud.py"
+# Если сейчас в репо главный файл называется bot.py — оставляем так:
+cmd = "python bot.py"
+
 
