@@ -5,4 +5,5 @@ nixPkgs = ["ffmpeg", "python311"]
 cmds = ["pip install --no-cache-dir -r requirements.txt"]
 
 [start]
-cmd = "python bot.py"
+cmd = "python bot_cloud.py"
+
