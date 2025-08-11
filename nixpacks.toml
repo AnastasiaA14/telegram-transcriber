@@ -1,7 +1,9 @@
 [phases.setup]
+# Ставим Python и ffmpeg
 nixPkgs = ["python311", "ffmpeg"]
 
 [phases.install]
+# Делаем свою виртуалку и ставим зависимости в неё
 cmds = [
   "python3 -m venv /opt/venv",
   "/opt/venv/bin/python -m pip install --upgrade pip",
@@ -9,7 +11,9 @@ cmds = [
 ]
 
 [start]
-cmd = "/opt/venv/bin/python bot.py"
+# Запускаем быструю облачную версию
+cmd = "/opt/venv/bin/python bot_cloud.py"
+
 
 
 
