@@ -1,20 +1,24 @@
 [phases.setup]
-# Ставим Python, сам pip как пакет и ffmpeg
-nixPkgs = ["python311", "python311Packages.pip", "ffmpeg"]
+# Ставим Python и ffmpeg (pip подтянем внутри виртуалки)
+nixPkgs = ["python311", "ffmpeg"]
 
 [phases.install]
-# Используем pip из Python — так надёжнее на Nix
+# Создаём своё виртуальное окружение и ставим туда pip + зависимости
 cmds = [
-  "python3 -m pip install --upgrade pip",
-  "python3 -m pip install --no-cache-dir -r requirements.txt"
+  "python3 -m venv /opt/venv",
+  "/opt/venv/bin/python -m pip install --upgrade pip",
+  "/opt/venv/bin/pip install --no-cache-dir -r requirements.txt"
 ]
 
 [start]
-# Если запускаешь локальную версию — оставь bot.py
-# cmd = "python bot.py"
+# ВЫБЕРИ один вариант запуска:
 
-# Если запускаешь облачную быструю версию (Deepgram) — раскомментируй эту строку:
-cmd = "python bot_cloud.py"
+# 1) Если запускаешь облачную, быструю версию на Deepgram:
+cmd = "/opt/venv/bin/python bot_cloud.py"
+
+# 2) Если запускаешь локальный Whisper (медленнее):
+# cmd = "/opt/venv/bin/python bot.py"
+
 
 
 
