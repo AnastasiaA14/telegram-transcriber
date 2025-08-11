@@ -1,1 +1,2 @@
-web: /opt/venv/bin/python bot.py
+worker: python bot.py
+
