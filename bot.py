@@ -1,73 +1,87 @@
-import os 
+import os
 import tempfile
 import logging
 import datetime
 import requests
+import subprocess
 import time
-from moviepy.editor import VideoFileClip
-from pydub import AudioSegment
+
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+
 import whisper
+import gdown
 
-TELEGRAM_TOKEN = "7557009279:AAH9htYr2GVzCH9u5f9kGxgaoqrOSN0xkNQ"
-
+# ---------- Logging ----------
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-model = whisper.load_model("medium")
+# ---------- Config ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не установлена. Добавьте её в Railway → Variables.")
 
-def extract_direct_download_link(link: str) -> str:
-    if "drive.google.com" in link and "/file/d/" in link:
-        file_id = link.split("/file/d/")[1].split("/")[0]
-        return f"https://drive.google.com/uc?export=download&id={file_id}"
-    return link
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # small/base/medium/large-v2
 
-def is_audio_file(file_path):
-    return any(file_path.lower().endswith(ext) for ext in ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'])
+_model = None
+def get_model():
+    global _model
+    if _model is None:
+        logger.info(f"Загружаю модель Whisper: {WHISPER_MODEL}")
+        _model = whisper.load_model(WHISPER_MODEL)
+    return _model
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    media = update.message.video or update.message.voice or update.message.audio or update.message.document
-    if not media:
-        await update.message.reply_text("Это не поддерживаемый тип файла.")
+# ---------- Helpers ----------
+def ffmpeg_extract_audio(input_path: str, audio_path: str) -> None:
+    """Извлекает аудио дорожку в моно WAV 16 кГц с помощью ffmpeg."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vn",            # Без видео
+        "-ac", "1",       # Моно
+        "-ar", "16000",   # 16 кГц
+        audio_path,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        err = proc.stderr.decode(errors="ignore")[-1000:]
+        raise RuntimeError(f"ffmpeg не смог извлечь аудио. Последние строки лога:\n{err}")
+
+def download_from_link(link: str, dest_path: str) -> None:
+    """Скачивает файл по ссылке. Для Google Drive использует gdown (обходит подтверждение)."""
+    if "drive.google.com" in link:
+        # gdown сам разберётся с форматом ссылки (/file/d/... или uc?id=...),
+        # а также с подтверждением скачивания для больших файлов.
+        gdown.download(url=link, output=dest_path, fuzzy=True, quiet=True)
         return
 
-    file = await context.bot.get_file(media.file_id)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    with requests.get(link, headers=headers, stream=True, timeout=60) as r:
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        if r.status_code != 200 or "html" in content_type:
+            raise RuntimeError("Скачалась HTML-страница вместо файла. Проверьте прямую ссылку и доступ.")
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+def ensure_min_size(path: str, min_bytes: int = 1_000_000) -> None:
+    if not os.path.exists(path) or os.path.getsize(path) < min_bytes:
+        raise RuntimeError("Файл слишком маленький или не докачался (меньше 1 МБ).")
+
+async def transcribe_and_reply(local_media_path: str, update: Update) -> None:
+    await update.message.reply_text("⏳ Извлекаю аудио (ffmpeg)...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input")
         audio_path = os.path.join(tmpdir, "audio.wav")
+        ffmpeg_extract_audio(local_media_path, audio_path)
 
-        await file.download_to_drive(input_path)
-        await update.message.reply_text("⏳ Файл скачан. Обрабатываем...")
+        await update.message.reply_text("⏳ Распознаю (Whisper)...")
+        model = get_model()
+        result = model.transcribe(audio_path, fp16=False, verbose=False, language="ru")
+        text = (result or {}).get("text", "").strip()
 
-        try:
-            if is_audio_file(input_path):
-                audio = AudioSegment.from_file(input_path)
-                audio.export(audio_path, format="wav")
-            else:
-                for _ in range(10):
-                    try:
-                        clip = VideoFileClip(input_path)
-                        break
-                    except OSError:
-                        time.sleep(1)
-                else:
-                    raise Exception("Файл занят другим процессом или повреждён.")
-                clip.audio.write_audiofile(audio_path, verbose=False, logger=None)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка при извлечении аудио: {e}")
-            return
-
-        await update.message.reply_text("⏳ Распознаем...")
-
-        try:
-            result = model.transcribe(audio_path, fp16=False, verbose=False, language='ru')
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка при распознавании: {e}")
-            return
-
-        text = result.get("text", "")
-        if not text.strip():
+        if not text:
             await update.message.reply_text("Не удалось распознать речь.")
             return
 
@@ -80,78 +94,59 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(document=InputFile(f, filename=os.path.basename(txt_path)))
         await update.message.reply_text("✅ Готово! Текст отправлен.")
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Handlers ----------
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    media = update.message.video or update.message.voice or update.message.audio or update.message.document
+    if not media:
+        await update.message.reply_text("Это не поддерживаемый тип файла.")
+        return
+
+    file = await context.bot.get_file(media.file_id)
+    await update.message.reply_text("⏳ Скачиваю файл...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.bin")
+        await file.download_to_drive(input_path)
+
+        try:
+            ensure_min_size(input_path)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Проблема со скачиванием: {e}")
+            return
+
+        await transcribe_and_reply(input_path, update)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or update.message.caption or ""
-    link = next((word for word in text.split() if word.startswith("http")), None)
+    link = next((w for w in text.split() if w.startswith("http")), None)
 
     if not link:
         await update.message.reply_text("ℹ️ Отправьте ссылку на файл или загрузите видео/аудио напрямую.")
         return
 
     await update.message.reply_text("⏳ Загружаю файл по ссылке...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_path = os.path.join(tmpdir, "downloaded.bin")
 
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            local_path = os.path.join(tmpdir, "downloaded.mp4")
-            audio_path = os.path.join(tmpdir, "audio.wav")
+        try:
+            download_from_link(link, local_path)
+            ensure_min_size(local_path)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка при скачивании: {e}")
+            return
 
-            link = extract_direct_download_link(link)
-            headers = {"User-Agent": "Mozilla/5.0"}
-            response = requests.get(link, headers=headers, stream=True)
+        await transcribe_and_reply(local_path, update)
 
-            content_type = response.headers.get("Content-Type", "")
-            if "html" in content_type or response.status_code != 200:
-                raise Exception("Скачался HTML, а не видео. Возможно, доступ к файлу ограничен.")
-
-            with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            if os.path.getsize(local_path) < 1_000_000:
-                raise Exception("Файл слишком маленький. Возможно, он не был полностью скачан.")
-
-            if is_audio_file(local_path):
-                audio = AudioSegment.from_file(local_path)
-                audio.export(audio_path, format="wav")
-            else:
-                for _ in range(10):
-                    try:
-                        clip = VideoFileClip(local_path)
-                        break
-                    except OSError:
-                        time.sleep(1)
-                else:
-                    raise Exception("MoviePy не может открыть файл. Он занят другим процессом или повреждён.")
-                clip.audio.write_audiofile(audio_path, verbose=False, logger=None)
-
-            await update.message.reply_text("⏳ Распознаем...")
-
-            result = model.transcribe(audio_path, fp16=False, verbose=False, language='ru')
-            text = result.get("text", "")
-
-            if not text.strip():
-                await update.message.reply_text("Не удалось распознать речь.")
-                return
-
-            now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-            txt_path = os.path.join(tmpdir, f"transcript_{now}.txt")
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(text)
-
-            with open(txt_path, "rb") as f:
-                await update.message.reply_document(document=InputFile(f, filename=os.path.basename(txt_path)))
-            await update.message.reply_text("✅ Готово! Текст отправлен.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при обработке ссылки: {e}")
-
-if __name__ == "__main__":
+# ---------- Entrypoint ----------
+def main() -> None:
+    logger.info("📡 Бот запускается...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(MessageHandler(filters.VIDEO | filters.VOICE | filters.AUDIO | filters.Document.VIDEO | filters.Document.AUDIO, handle_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    logger.info("📡 Бот запущен")
+
+    logger.info("✅ Бот запущен. Ожидание сообщений...")
     app.run_polling()
 
-
-
-
-
+if __name__ == "__main__":
+    main()

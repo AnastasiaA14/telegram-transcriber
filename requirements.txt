@@ -1,7 +1,5 @@
-python-telegram-bot==20.8
-moviepy
-pydub
-requests
-whisper
-torchaudio
-git+https://github.com/openai/whisper.git
+python-telegram-bot==21.6
+requests==2.32.3
+gdown==5.2.0
+openai-whisper==20231117
+torch==2.3.1
