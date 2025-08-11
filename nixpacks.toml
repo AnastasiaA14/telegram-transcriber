@@ -3,7 +3,7 @@
 nixPkgs = ["python311", "ffmpeg"]
 
 [phases.install]
-# Делаем свою виртуалку и ставим зависимости в неё
+# Создаём своё виртуальное окружение и ставим зависимости в него
 cmds = [
   "python3 -m venv /opt/venv",
   "/opt/venv/bin/python -m pip install --upgrade pip",
@@ -11,8 +11,8 @@ cmds = [
 ]
 
 [start]
-# Запускаем быструю облачную версию
-cmd = "/opt/venv/bin/python bot_cloud.py"
+# Запускаем ТВОЙ файл bot.py
+cmd = "/opt/venv/bin/python bot.py"
 
 
 
