@@ -1,13 +1,20 @@
 [phases.setup]
-# Явно ставим Python и ffmpeg
-nixPkgs = ["python311", "ffmpeg"]
+# Ставим полную сборку Python (включает ensurepip) и ffmpeg
+nixPkgs = ["python311Full", "ffmpeg"]
 
 [phases.install]
-# Важно: вызываем pip через python, тогда он точно найдётся
-cmds = ["python -m pip install --no-cache-dir -r requirements.txt"]
+# Явно разворачиваем pip и ставим зависимости
+cmds = [
+  "python -m ensurepip --upgrade",
+  "python -m pip install --upgrade pip",
+  "python -m pip install --no-cache-dir -r requirements.txt"
+]
 
 [start]
-# Если сейчас в репо главный файл называется bot.py — оставляем так:
+# Если у тебя запускается bot.py — оставь так:
 cmd = "python bot.py"
+# Если запускаешь облачную версию — поменяй на:
+# cmd = "python bot_cloud.py"
+
 
 
