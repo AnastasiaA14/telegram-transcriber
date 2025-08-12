@@ -10,7 +10,4 @@ cmds = [
   "/opt/venv/bin/pip install --no-cache-dir -r requirements.txt"
 ]
 
-[start]
-# Стартуем локальный бот
-cmd = "/opt/venv/bin/python bot.py"
-
+# ВАЖНО: здесь нет [start] — запуск берём из Procfile, чтобы не было двух процессов и ошибки 409
