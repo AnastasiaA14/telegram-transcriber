@@ -1,13 +1,10 @@
 [phases.setup]
-# Python и ffmpeg для конвертации аудио
 nixPkgs = ["python311", "ffmpeg"]
 
 [phases.install]
-# Виртуальное окружение + зависимости
 cmds = [
   "python3 -m venv /opt/venv",
   "/opt/venv/bin/python -m pip install --upgrade pip",
   "/opt/venv/bin/pip install --no-cache-dir -r requirements.txt"
 ]
 
-# ВАЖНО: здесь нет [start] — запуск берём из Procfile, чтобы не было двух процессов и ошибки 409
