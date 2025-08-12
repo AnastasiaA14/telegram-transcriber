@@ -4,9 +4,11 @@ import logging
 import tempfile
 import subprocess
 import requests
+from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
 
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.error import BadRequest
 
 # ===== ЛОГИ =====
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
@@ -17,34 +19,27 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не установлена.")
 
-# Провайдер: 'local' по умолчанию. (Deepgram можно включить позже переменной ASR_PROVIDER=deepgram)
-ASR_PROVIDER = os.getenv("ASR_PROVIDER", "local").lower()
-
-# Настройки локальной модели faster-whisper
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")   # варианты: tiny/base/small/medium
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))  # 1 — быстрее
+# Локальное распознавание (faster-whisper)
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")          # tiny/base/small/medium
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1")) # 1 — быстрее
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 | int8_float16 | float32
-LANGUAGE = os.getenv("LANGUAGE", "ru")  # 'ru' для стабильности. Поставь 'auto' — для автоопределения.
+LANGUAGE = os.getenv("LANGUAGE", "ru")                       # 'auto' для автоопределения
 
-# Deepgram (на будущее, можно не задавать)
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-ASR_DIARIZE = os.getenv("ASR_DIARIZE", "false").lower() in ("1", "true", "yes")
+# Лимит вложения в ТГ (ориентир): если больше — просим ссылку
+TELEGRAM_ATTACHMENT_LIMIT = 45 * 1024 * 1024  # 45 МБ
 
 # ===== УТИЛИТЫ =====
 def ensure_min_size(path: str, min_bytes: int = 10_000) -> None:
-    """Ранний отсев пустых/битых файлов (10 КБ по умолчанию)."""
     if not os.path.exists(path) or os.path.getsize(path) < min_bytes:
         raise RuntimeError(f"Файл слишком маленький или не докачался (< {min_bytes // 1000} КБ).")
 
 def run_ffmpeg(cmd: list) -> None:
-    """Запускаем ffmpeg и поднимаем понятную ошибку при падении."""
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         tail = proc.stderr.decode(errors="ignore")[-1200:]
         raise RuntimeError(f"ffmpeg ошибка:\n{tail}")
 
 def extract_audio_to_wav16k_mono(src_path: str, dst_wav_path: str) -> None:
-    """Вытаскиваем аудио в WAV 16кГц/моно. Добавляем лёгкую нормализацию громкости."""
     cmd = [
         "ffmpeg", "-y",
         "-i", src_path,
@@ -56,41 +51,48 @@ def extract_audio_to_wav16k_mono(src_path: str, dst_wav_path: str) -> None:
     ]
     run_ffmpeg(cmd)
 
-def normalize_link(url: str) -> str:
-    """Пытаемся превратить общие ссылки в 'прямые' для скачивания."""
-    try:
-        url = url.strip()
+# ---------- Google Drive: делаем прямую ссылку ----------
+def normalize_google_drive(url: str) -> str | None:
+    # /file/d/<ID>/view?...  -> uc?export=download&id=<ID>
+    m = re.search(r"drive\.google\.com/.*/file/d/([^/]+)/", url)
+    if m:
+        fid = m.group(1)
+        return f"https://drive.google.com/uc?export=download&id={fid}"
+    # open?id=<ID> -> uc?export=download&id=<ID>
+    m = re.search(r"drive\.google\.com/.*[?&]id=([^&]+)", url)
+    if m:
+        fid = m.group(1)
+        return f"https://drive.google.com/uc?export=download&id={fid}"
+    return None
 
-        # Nextcloud/ownCloud публичные ссылки вида .../s/<id> -> добавляем /download
-        if "/s/" in url and "download" not in url:
-            if not url.endswith("/download"):
-                url = url.rstrip("/") + "/download"
+# ---------- Zoom: share/play -> download, добавляем pwd ----------
+def normalize_zoom(url: str, pwd_hint: str | None) -> str | None:
+    if "zoom.us/rec/" not in url:
+        return None
+    p = urlparse(url)
+    path = p.path
+    q = parse_qs(p.query)
+    pwd = (q.get("pwd", [None])[0]) or (pwd_hint or None)
 
-        # Google Drive:
-        # 1) /file/d/<ID>/view?... -> /uc?export=download&id=<ID>
-        m = re.search(r"drive\.google\.com/.*/file/d/([^/]+)/", url)
-        if m:
-            fid = m.group(1)
-            return f"https://drive.google.com/uc?export=download&id={fid}"
-        # 2) open?id=<ID> -> /uc?export=download&id=<ID>
-        m = re.search(r"drive\.google\.com/.*[?&]id=([^&]+)", url)
-        if m:
-            fid = m.group(1)
-            return f"https://drive.google.com/uc?export=download&id={fid}"
+    # заменим /play или /share на /download
+    path = path.replace("/play", "/download").replace("/share", "/download")
 
-        return url
-    except Exception:
-        return url
+    # соберём query обратно, добавим pwd если есть
+    if pwd:
+        q["pwd"] = [pwd]
+    query = urlencode({k: v[0] for k, v in q.items() if v and v[0] is not None})
+    new_url = urlunparse((p.scheme, p.netloc, path, "", query, ""))
+    return new_url
 
-def download_from_link(link: str, dest_path: str) -> None:
-    """Качаем по ссылке (stream). Отсекаем HTML-страницы (непрямая ссылка)."""
-    link = normalize_link(link)
+def download_http(link: str, dest_path: str, referer: str | None = None) -> None:
     headers = {"User-Agent": "Mozilla/5.0"}
-    with requests.get(link, headers=headers, stream=True, timeout=300, allow_redirects=True) as r:
+    if referer:
+        headers["Referer"] = referer
+    with requests.get(link, headers=headers, stream=True, timeout=1800, allow_redirects=True) as r:
         ctype = (r.headers.get("Content-Type") or "").lower()
-        # Если явно HTML/текст — это почти всегда страница предпросмотра
+        # Zoom/Drive могут отдавать octet-stream или video/* — это ок; HTML — плохо
         if "html" in ctype or "text/" in ctype:
-            raise RuntimeError("Скачалась HTML-страница. Нужна ПРЯМАЯ ссылка на файл (или Nextcloud с /download).")
+            raise RuntimeError("Скачалась HTML-страница. Нужна прямая ссылка на файл (или верный пароль для Zoom).")
         total = 0
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -98,7 +100,7 @@ def download_from_link(link: str, dest_path: str) -> None:
                     f.write(chunk)
                     total += len(chunk)
         if total < 10_000:
-            raise RuntimeError("По ссылке пришёл слишком маленький файл (<10 КБ). Проверьте прямую ссылку.")
+            raise RuntimeError("По ссылке пришёл слишком маленький файл (<10 КБ).")
 
 # ===== ЛОКАЛЬНОЕ РАСПОЗНАВАНИЕ (faster-whisper) =====
 _faster_model = None
@@ -118,9 +120,9 @@ def load_faster_whisper():
 
 def transcribe_local(wav_path: str) -> str:
     (model, language) = load_faster_whisper()
-    segments, info = model.transcribe(
+    segments, _ = model.transcribe(
         wav_path,
-        language=language,                    # None -> автоопределение
+        language=language,
         beam_size=WHISPER_BEAM_SIZE,
         vad_filter=False,
         condition_on_previous_text=False,
@@ -133,49 +135,54 @@ def transcribe_local(wav_path: str) -> str:
             parts.append(t)
     return "\n".join(parts).strip()
 
-# ===== ОБЛАЧНОЕ РАСПОЗНАВАНИЕ (Deepgram, если включено) =====
-def transcribe_deepgram(wav_path: str) -> str:
-    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/wav"}
-    params = {
-        "smart_format": "true",
-        "punctuate": "true",
-        "paragraphs": "true",
-        "diarize": "true" if ASR_DIARIZE else "false",
-        "language": LANGUAGE if LANGUAGE.lower() != "auto" else "ru"
-    }
-    with open(wav_path, "rb") as f:
-        r = requests.post("https://api.deepgram.com/v1/listen", headers=headers, params=params, data=f, timeout=1800)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Deepgram вернул ошибку {r.status_code}:\n{r.text[:600]}")
-    data = r.json()
-    try:
-        alts = data["results"]["channels"][0]["alternatives"]
-        paragraphs = alts[0].get("paragraphs", {}).get("paragraphs") or []
-        if paragraphs:
-            out = []
-            for p in paragraphs:
-                txt = (p.get("text") or "").strip()
-                if not txt:
-                    continue
-                if ASR_DIARIZE and p.get("speaker") is not None:
-                    out.append(f"Спикер {p['speaker']}: {txt}")
-                else:
-                    out.append(txt)
-            if out:
-                return "\n\n".join(out).strip()
-        return (alts[0].get("transcript") or "").strip()
-    except Exception:
-        return ""
-
 # ===== ХЭНДЛЕРЫ =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg:
         return
 
-    # 1) Если прислали вложение (видео/аудио/документ)
+    # 0) Если это ссылка в тексте/подписи — обработаем как ссылку (универсально для больших файлов)
+    text_all = (msg.text or "") + " " + (msg.caption or "")
+    m_url = re.search(r"(https?://\S+)", text_all)
+    m_pwd = re.search(r"\bpwd\s*[:=]\s*([A-Za-z0-9]+)", text_all)  # можно прислать: "pwd: ABCD1234"
+    pwd_hint = m_pwd.group(1) if m_pwd else None
+
+    if m_url:
+        raw_url = m_url.group(1)
+        await msg.reply_text("🌐 Скачиваю файл по ссылке…")
+
+        # Нормализуем ссылку, если это Drive или Zoom
+        gdrive = normalize_google_drive(raw_url)
+        if gdrive:
+            norm_url, referer = gdrive, None
+        else:
+            z = normalize_zoom(raw_url, pwd_hint)
+            if z:
+                norm_url, referer = z, raw_url  # Zoom иногда требует Referer на share/play
+            else:
+                norm_url, referer = raw_url, None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "download.bin")
+            try:
+                download_http(norm_url, src, referer=referer)
+                ensure_min_size(src, 10_000)
+            except Exception as e:
+                await msg.reply_text(f"❌ Ошибка загрузки: {e}\n"
+                                     f"Для Zoom: пришлите ссылку на запись + пароль в сообщении, например:\n"
+                                     f"https://us02web.zoom.us/rec/share/...  pwd: ABCD1234")
+                return
+            await process_local_file(src, msg)
+        return
+
+    # 1) Вложение (если нет ссылки)
     media = msg.video or msg.voice or msg.audio or msg.document
     if media:
+        size = getattr(media, "file_size", None)
+        if size and size > TELEGRAM_ATTACHMENT_LIMIT:
+            await msg.reply_text("❗️ Файл слишком большой для вложения. Пришлите ссылку на файл (Google Drive/Zoom/другой хост).")
+            return
+
         await msg.reply_text("📥 Скачиваю файл…")
         tg_file = await context.bot.get_file(media.file_id)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -186,87 +193,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as e:
                 await msg.reply_text(f"❌ {e}")
                 return
-
-            await msg.reply_text("🎙 Извлекаю аудио (ffmpeg)…")
-            wav = os.path.join(tmpdir, "audio.wav")
-            try:
-                extract_audio_to_wav16k_mono(src, wav)
-            except Exception as e:
-                await msg.reply_text(f"❌ Ошибка при конвертации: {e}")
-                return
-
-            try:
-                if ASR_PROVIDER == "deepgram" and DEEPGRAM_API_KEY:
-                    await msg.reply_text("🤖 Распознаю (Deepgram)…")
-                    text = transcribe_deepgram(wav)
-                else:
-                    await msg.reply_text("🤖 Распознаю (локально, faster-whisper)…")
-                    text = transcribe_local(wav)
-            except Exception as e:
-                await msg.reply_text(f"❌ Ошибка распознавания: {e}")
-                return
-
-            if text:
-                out_path = os.path.join(tmpdir, "transcript.txt")
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(text)
-                await msg.reply_document(InputFile(out_path, filename="transcript.txt"))
-                await msg.reply_text("✅ Готово.")
-            else:
-                await msg.reply_text("⚠️ Текст не получен. Попробуйте запись подлиннее/громче или чище источник.")
+            await process_local_file(src, msg)
         return
 
-    # 2) Если прислали ссылку (в тексте или подписи)
-    text = (msg.text or "") + " " + (msg.caption or "")
-    m = re.search(r"(https?://\S+)", text)
-    if m:
-        link = m.group(1)
-        await msg.reply_text("🌐 Скачиваю файл по ссылке…")
+    # 2) Подсказка
+    await msg.reply_text("ℹ️ Пришлите аудио/видео как вложение (если не очень большое) ИЛИ ссылку на файл.\n"
+                         "Google Drive — обычная ссылка; Zoom — ссылка на запись + добавьте в сообщении `pwd: ПАРОЛЬ`.")
+
+async def process_local_file(src: str, msg):
+    try:
+        await msg.reply_text("🎙 Извлекаю аудио (ffmpeg)…")
         with tempfile.TemporaryDirectory() as tmpdir:
-            src = os.path.join(tmpdir, "download.bin")
-            try:
-                download_from_link(link, src)
-                ensure_min_size(src, 10_000)
-            except Exception as e:
-                await msg.reply_text(f"❌ Ошибка загрузки по ссылке: {e}")
-                return
-
-            await msg.reply_text("🎙 Извлекаю аудио (ffmpeg)…")
             wav = os.path.join(tmpdir, "audio.wav")
-            try:
-                extract_audio_to_wav16k_mono(src, wav)
-            except Exception as e:
-                await msg.reply_text(f"❌ Ошибка при конвертации: {e}")
-                return
+            extract_audio_to_wav16k_mono(src, wav)
 
-            try:
-                if ASR_PROVIDER == "deepgram" and DEEPGRAM_API_KEY:
-                    await msg.reply_text("🤖 Распознаю (Deepgram)…")
-                    text_out = transcribe_deepgram(wav)
-                else:
-                    await msg.reply_text("🤖 Распознаю (локально, faster-whisper)…")
-                    text_out = transcribe_local(wav)
-            except Exception as e:
-                await msg.reply_text(f"❌ Ошибка распознавания: {e}")
-                return
+            await msg.reply_text("🤖 Распознаю (локально, faster-whisper)…")
+            text_out = transcribe_local(wav)
 
             if text_out:
                 out_path = os.path.join(tmpdir, "transcript.txt")
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(text_out)
-                await msg.reply_document(InputFile(out_path, filename="transcript.txt"))
+                try:
+                    await msg.reply_document(InputFile(out_path, filename="transcript.txt"))
+                except BadRequest:
+                    await msg.reply_text("✅ Готово. Текст длинный — пришлю частями.")
+                    with open(out_path, "r", encoding="utf-8") as f:
+                        data = f.read()
+                    for i in range(0, len(data), 3500):
+                        await msg.reply_text(data[i:i+3500])
                 await msg.reply_text("✅ Готово.")
             else:
-                await msg.reply_text("⚠️ Текст не получен. Убедитесь, что ссылка указывает на сам файл, не на страницу.")
-        return
-
-    # 3) Подсказка
-    await msg.reply_text("ℹ️ Пришлите аудио/видео вложением ИЛИ прямую ссылку на файл (Google Drive/Nextcloud/прямая ссылка).")
+                await msg.reply_text("⚠️ Текст не получен. Убедитесь, что источник не пустой/без звука.")
+    except Exception as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
 
 # ===== ЗАПУСК =====
 def main():
-    log.info("Запуск бота… ASR_PROVIDER=%s, WHISPER_MODEL=%s, compute=%s, language=%s",
-             ASR_PROVIDER, WHISPER_MODEL, WHISPER_COMPUTE_TYPE, LANGUAGE)
+    log.info("Запуск бота… WHISPER_MODEL=%s, compute=%s, language=%s", WHISPER_MODEL, WHISPER_COMPUTE_TYPE, LANGUAGE)
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     log.info("✅ Бот запущен. Ожидание сообщений…")
