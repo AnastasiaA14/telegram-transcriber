@@ -25,7 +25,7 @@ WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1")) # 1 — быстр�
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 | int8_float16 | float32
 LANGUAGE = os.getenv("LANGUAGE", "ru")                       # 'auto' для автоопределения
 
-# Лимит вложения в ТГ (ориентир): если больше — просим ссылку
+# Лимит вложения в ТГ (ориентир)
 TELEGRAM_ATTACHMENT_LIMIT = 45 * 1024 * 1024  # 45 МБ
 
 # ===== УТИЛИТЫ =====
@@ -63,7 +63,7 @@ def normalize_google_drive(url: str) -> str | None:
         return f"https://drive.google.com/uc?export=download&id={fid}"
     return None
 
-# ---------- Вытаскиваем пароль из текста (любые языки/форматы) ----------
+# ---------- Вытаскиваем пароль (любые языки/форматы) ----------
 PWD_PATTERNS = [
     r"\bpwd\s*[:=]\s*(\S+)",                         # pwd: XXXXX
     r"(?i)\bpasscode\s*[:=]\s*(\S+)",                # passcode: XXXXX
@@ -78,36 +78,76 @@ def extract_pwd_hint(text: str) -> str | None:
             return m.group(1).strip()
     return None
 
-# ---------- Zoom: share/play -> download, добавляем (и кодируем) pwd ----------
-def normalize_zoom(url: str, pwd_hint: str | None) -> str | None:
-    if "zoom.us/rec/" not in url:
+# ---------- Zoom: двухшаговая загрузка (share/play -> cookies -> download) ----------
+def build_zoom_urls(raw_url: str, pwd_hint: str | None):
+    """Возвращает (share_url_with_pwd, download_url, referer). Пароль кодируем."""
+    p = urlparse(raw_url)
+    if "zoom.us" not in p.netloc or "/rec/" not in p.path:
         return None
-    p = urlparse(url)
-    path = p.path
+
     q = parse_qs(p.query)
     pwd = q.get("pwd", [None])[0] or pwd_hint
+    path_share = p.path
+    # share/play -> оставим как есть для шага 1 (cookie)
+    share_q = dict((k, v[0]) for k, v in q.items() if v and v[0] is not None)
 
-    # заменим /play или /share на /download
-    path = path.replace("/play", "/download").replace("/share", "/download")
+    # Сконструируем download путь
+    path_download = path_share.replace("/play", "/download").replace("/share", "/download")
+    dl_q = dict(share_q)
 
-    # кодируем пароль (важно для символов типа $ ^ и т.п.)
     if pwd:
-        pwd_enc = quote(pwd, safe="")  # полностью URL-кодируем
-        q["pwd"] = [pwd_enc]
+        # важно кодировать полностью
+        dl_q["pwd"] = quote(pwd, safe="")
+        # и в share тоже добавим (часто помогает избежать промежуточной формы)
+        share_q["pwd"] = dl_q["pwd"]
 
-    query = urlencode({k: v[0] for k, v in q.items() if v and v[0] is not None})
-    new_url = urlunparse((p.scheme, p.netloc, path, "", query, ""))
-    return new_url
+    # полезно явно просить скачивание
+    dl_q["download"] = "1"
 
+    share_url = urlunparse((p.scheme, p.netloc, path_share, "", urlencode(share_q), ""))
+    download_url = urlunparse((p.scheme, p.netloc, path_download, "", urlencode(dl_q), ""))
+
+    return share_url, download_url, raw_url  # referer = исходная share/play ссылка
+
+def download_zoom_2step(raw_url: str, pwd_hint: str | None, dest_path: str) -> None:
+    built = build_zoom_urls(raw_url, pwd_hint)
+    if not built:
+        raise RuntimeError("Ссылка не похожа на Zoom запись.")
+    share_url, download_url, referer = built
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": referer
+    }
+    s = requests.Session()
+
+    # Шаг 1: зайти на share/play, чтобы получить cookies (и передать pwd через URL)
+    r1 = s.get(share_url, headers=headers, allow_redirects=True, timeout=1800)
+    # Иногда Zoom всё равно возвращает HTML-страницу, это нормально — главное, что cookies поставились
+
+    # Шаг 2: скачать download с теми же cookies
+    with s.get(download_url, headers=headers, stream=True, allow_redirects=True, timeout=1800) as r2:
+        ctype = (r2.headers.get("Content-Type") or "").lower()
+        if "html" in ctype or "text/" in ctype:
+            raise RuntimeError("Zoom не выдал файл. Проверьте пароль и включено ли скачивание в настройках записи.")
+        total = 0
+        with open(dest_path, "wb") as f:
+            for chunk in r2.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
+        if total < 10_000:
+            raise RuntimeError("Zoom выдал слишком маленький файл (<10 КБ).")
+
+# ---------- Обычное скачивание по прямому URL ----------
 def download_http(link: str, dest_path: str, referer: str | None = None) -> None:
     headers = {"User-Agent": "Mozilla/5.0"}
     if referer:
         headers["Referer"] = referer
     with requests.get(link, headers=headers, stream=True, timeout=1800, allow_redirects=True) as r:
         ctype = (r.headers.get("Content-Type") or "").lower()
-        # Zoom/Drive могут отдавать octet-stream или video/* — это ок; HTML — плохо
         if "html" in ctype or "text/" in ctype:
-            raise RuntimeError("Скачалась HTML-страница. Нужна прямая ссылка на файл (или верный пароль для Zoom).")
+            raise RuntimeError("Скачалась HTML-страница. Нужна прямая ссылка на файл.")
         total = 0
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -156,7 +196,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not msg:
         return
 
-    # 0) Проверим ссылку (в тексте/подписи)
+    # 0) Ссылка в тексте/подписи
     text_all = (msg.text or "") + " " + (msg.caption or "")
     m_url = re.search(r"(https?://\S+)", text_all)
     pwd_hint = extract_pwd_hint(text_all)
@@ -165,36 +205,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         raw_url = m_url.group(1)
         await msg.reply_text("🌐 Скачиваю файл по ссылке…")
 
-        # Нормализуем: Google Drive / Zoom / иначе как есть
-        gdrive = normalize_google_drive(raw_url)
-        if gdrive:
-            norm_url, referer = gdrive, None
-        else:
-            z = normalize_zoom(raw_url, pwd_hint)
-            if z:
-                norm_url, referer = z, raw_url  # Referer помогает Zoom
-            else:
-                norm_url, referer = raw_url, None
-
         with tempfile.TemporaryDirectory() as tmpdir:
             src = os.path.join(tmpdir, "download.bin")
             try:
-                download_http(norm_url, src, referer=referer)
+                if "zoom.us/rec/" in raw_url:
+                    # Zoom: двухшаговая загрузка с паролем/куки
+                    download_zoom_2step(raw_url, pwd_hint, src)
+                else:
+                    # Google Drive/другие — нормализуем Drive, иначе качаем как есть
+                    gdrive = normalize_google_drive(raw_url)
+                    norm_url = gdrive or raw_url
+                    download_http(norm_url, src)
                 ensure_min_size(src, 10_000)
             except Exception as e:
                 await msg.reply_text(
                     "❌ Ошибка загрузки: {err}\n\n"
                     "Подсказки:\n"
-                    "• Для Zoom пришлите ссылку на запись и строку с паролем в сообщении, например:\n"
+                    "• Для Zoom пришлите ссылку на запись и пароль в сообщении, например:\n"
                     "  pwd: ABCD1234  или  Секретный код: ABCD1234\n"
-                    "• Для Google Drive дайте обычную ссылку — я сделаю прямую автоматически."
+                    "• Убедитесь, что у записи включено разрешение «Allow viewers to download»."
                     .format(err=e)
                 )
                 return
             await process_local_file(src, msg)
         return
 
-    # 1) Если прислано вложение
+    # 1) Вложение (если нет ссылки)
     media = msg.video or msg.voice or msg.audio or msg.document
     if media:
         size = getattr(media, "file_size", None)
@@ -216,8 +252,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # 2) Подсказка
-    await msg.reply_text("ℹ️ Пришлите аудио/видео как вложение (если не очень большое) ИЛИ ссылку на файл.\n"
-                         "Поддержка: Google Drive, Zoom (добавьте в сообщении пароль: `pwd: ...` или `Секретный код: ...`).")
+    await msg.reply_text("ℹ️ Пришлите аудио/видео вложением (если не очень большое) ИЛИ ссылку на файл.\n"
+                         "Поддержка: Google Drive (обычная ссылка), Zoom (добавьте пароль в сообщении).")
 
 async def process_local_file(src: str, msg):
     try:
