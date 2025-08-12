@@ -1,9 +1,9 @@
 [phases.setup]
-# Ставим Python и ffmpeg
+# Python и ffmpeg для конвертации аудио
 nixPkgs = ["python311", "ffmpeg"]
 
 [phases.install]
-# Создаём своё виртуальное окружение и ставим зависимости в него
+# Виртуальное окружение + зависимости
 cmds = [
   "python3 -m venv /opt/venv",
   "/opt/venv/bin/python -m pip install --upgrade pip",
@@ -11,10 +11,6 @@ cmds = [
 ]
 
 [start]
-# Запускаем ТВОЙ файл bot.py
+# Стартуем локальный бот
 cmd = "/opt/venv/bin/python bot.py"
-
-
-
-
 
