@@ -4,7 +4,7 @@ import logging
 import tempfile
 import subprocess
 import requests
-from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
+from urllib.parse import urlparse, parse_qs, urlunparse, urlencode, quote
 
 from telegram import Update, InputFile
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
@@ -53,33 +53,48 @@ def extract_audio_to_wav16k_mono(src_path: str, dst_wav_path: str) -> None:
 
 # ---------- Google Drive: делаем прямую ссылку ----------
 def normalize_google_drive(url: str) -> str | None:
-    # /file/d/<ID>/view?...  -> uc?export=download&id=<ID>
     m = re.search(r"drive\.google\.com/.*/file/d/([^/]+)/", url)
     if m:
         fid = m.group(1)
         return f"https://drive.google.com/uc?export=download&id={fid}"
-    # open?id=<ID> -> uc?export=download&id=<ID>
     m = re.search(r"drive\.google\.com/.*[?&]id=([^&]+)", url)
     if m:
         fid = m.group(1)
         return f"https://drive.google.com/uc?export=download&id={fid}"
     return None
 
-# ---------- Zoom: share/play -> download, добавляем pwd ----------
+# ---------- Вытаскиваем пароль из текста (любые языки/форматы) ----------
+PWD_PATTERNS = [
+    r"\bpwd\s*[:=]\s*(\S+)",                         # pwd: XXXXX
+    r"(?i)\bpasscode\s*[:=]\s*(\S+)",                # passcode: XXXXX
+    r"(?i)\bpassword\s*[:=]\s*(\S+)",                # password: XXXXX
+    r"(?i)\bсекретн[ыйаяе]\s*код\s*[:=]\s*(\S+)",    # Секретный код: XXXXX
+    r"(?i)\bпарол[ья]\s*[:=]\s*(\S+)",               # Пароль: XXXXX
+]
+def extract_pwd_hint(text: str) -> str | None:
+    for pat in PWD_PATTERNS:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1).strip()
+    return None
+
+# ---------- Zoom: share/play -> download, добавляем (и кодируем) pwd ----------
 def normalize_zoom(url: str, pwd_hint: str | None) -> str | None:
     if "zoom.us/rec/" not in url:
         return None
     p = urlparse(url)
     path = p.path
     q = parse_qs(p.query)
-    pwd = (q.get("pwd", [None])[0]) or (pwd_hint or None)
+    pwd = q.get("pwd", [None])[0] or pwd_hint
 
     # заменим /play или /share на /download
     path = path.replace("/play", "/download").replace("/share", "/download")
 
-    # соберём query обратно, добавим pwd если есть
+    # кодируем пароль (важно для символов типа $ ^ и т.п.)
     if pwd:
-        q["pwd"] = [pwd]
+        pwd_enc = quote(pwd, safe="")  # полностью URL-кодируем
+        q["pwd"] = [pwd_enc]
+
     query = urlencode({k: v[0] for k, v in q.items() if v and v[0] is not None})
     new_url = urlunparse((p.scheme, p.netloc, path, "", query, ""))
     return new_url
@@ -141,24 +156,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not msg:
         return
 
-    # 0) Если это ссылка в тексте/подписи — обработаем как ссылку (универсально для больших файлов)
+    # 0) Проверим ссылку (в тексте/подписи)
     text_all = (msg.text or "") + " " + (msg.caption or "")
     m_url = re.search(r"(https?://\S+)", text_all)
-    m_pwd = re.search(r"\bpwd\s*[:=]\s*([A-Za-z0-9]+)", text_all)  # можно прислать: "pwd: ABCD1234"
-    pwd_hint = m_pwd.group(1) if m_pwd else None
+    pwd_hint = extract_pwd_hint(text_all)
 
     if m_url:
         raw_url = m_url.group(1)
         await msg.reply_text("🌐 Скачиваю файл по ссылке…")
 
-        # Нормализуем ссылку, если это Drive или Zoom
+        # Нормализуем: Google Drive / Zoom / иначе как есть
         gdrive = normalize_google_drive(raw_url)
         if gdrive:
             norm_url, referer = gdrive, None
         else:
             z = normalize_zoom(raw_url, pwd_hint)
             if z:
-                norm_url, referer = z, raw_url  # Zoom иногда требует Referer на share/play
+                norm_url, referer = z, raw_url  # Referer помогает Zoom
             else:
                 norm_url, referer = raw_url, None
 
@@ -168,19 +182,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 download_http(norm_url, src, referer=referer)
                 ensure_min_size(src, 10_000)
             except Exception as e:
-                await msg.reply_text(f"❌ Ошибка загрузки: {e}\n"
-                                     f"Для Zoom: пришлите ссылку на запись + пароль в сообщении, например:\n"
-                                     f"https://us02web.zoom.us/rec/share/...  pwd: ABCD1234")
+                await msg.reply_text(
+                    "❌ Ошибка загрузки: {err}\n\n"
+                    "Подсказки:\n"
+                    "• Для Zoom пришлите ссылку на запись и строку с паролем в сообщении, например:\n"
+                    "  pwd: ABCD1234  или  Секретный код: ABCD1234\n"
+                    "• Для Google Drive дайте обычную ссылку — я сделаю прямую автоматически."
+                    .format(err=e)
+                )
                 return
             await process_local_file(src, msg)
         return
 
-    # 1) Вложение (если нет ссылки)
+    # 1) Если прислано вложение
     media = msg.video or msg.voice or msg.audio or msg.document
     if media:
         size = getattr(media, "file_size", None)
         if size and size > TELEGRAM_ATTACHMENT_LIMIT:
-            await msg.reply_text("❗️ Файл слишком большой для вложения. Пришлите ссылку на файл (Google Drive/Zoom/другой хост).")
+            await msg.reply_text("❗️ Файл слишком большой для вложения. Пришлите ссылку (Zoom/Google Drive/другой хост).")
             return
 
         await msg.reply_text("📥 Скачиваю файл…")
@@ -198,7 +217,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 2) Подсказка
     await msg.reply_text("ℹ️ Пришлите аудио/видео как вложение (если не очень большое) ИЛИ ссылку на файл.\n"
-                         "Google Drive — обычная ссылка; Zoom — ссылка на запись + добавьте в сообщении `pwd: ПАРОЛЬ`.")
+                         "Поддержка: Google Drive, Zoom (добавьте в сообщении пароль: `pwd: ...` или `Секретный код: ...`).")
 
 async def process_local_file(src: str, msg):
     try:
