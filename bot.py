@@ -57,7 +57,7 @@ def normalize_link(url: str) -> str:
     if "/s/" in url and "download" not in url:
         if not url.endswith("/download"):
             url = url.rstrip("/") + "/download"
-    # Google Drive -> прямое скачивание
+    # Google Drive нормализуем НО настоящую загрузку сделаем в отдельной функции
     m = re.search(r"drive\.google\.com/.*/file/d/([^/]+)/", url)
     if m:
         fid = m.group(1)
@@ -86,42 +86,27 @@ def extract_passcode(text: str) -> str | None:
     return None
 
 def download_zoom_recording(share_url: str, passcode: str | None, dest_path: str) -> None:
-    """
-    1) Добавляем pwd в URL (?pwd=...) если он не указан.
-    2) Открываем страницу записи, вынимаем downloadUrl из HTML (это настоящая ссылка).
-    3) Скачиваем потоково файл.
-    Требует, чтобы владелец записи включил "Allow viewers to download".
-    """
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
-
-    # приклеиваем pwd к ссылке, если есть
     url = share_url
     if passcode and "pwd=" not in url:
         q = "&" if ("?" in url) else "?"
         url = f"{url}{q}pwd={urllib.parse.quote(passcode)}"
 
-    # грузим страницу
     r = session.get(url, timeout=120)
     if r.status_code != 200:
         raise RuntimeError("Zoom не пустил на страницу записи. Проверьте ссылку/пароль.")
 
     html_text = r.text
-
-    # ищем downloadUrl в HTML (в JSON внутри страницы). Экранированные символы \u0026 заменим на &
     m = re.search(r'"downloadUrl"\s*:\s*"([^"]+)"', html_text)
     if not m:
-        # иногда ссылка хранится как "downloadUrl":"https:\/\/...\/download?..."
-        # попробуем альтернативный ключ
         m = re.search(r'"downloadUrl"\s*:\s*"(https:\\/\\/[^"]+)"', html_text)
     if not m:
         raise RuntimeError("Zoom не выдал ссылку на скачивание. Включите «Allow viewers to download» у записи.")
 
     dl = m.group(1)
-    dl = html.unescape(dl)
-    dl = dl.replace("\\/", "/").replace("\\u0026", "&")
+    dl = html.unescape(dl).replace("\\/", "/").replace("\\u0026", "&")
 
-    # скачиваем файл
     with session.get(dl, stream=True, timeout=600) as resp:
         if resp.status_code != 200:
             raise RuntimeError(f"Zoom вернул статус {resp.status_code} при скачивании. Проверьте доступ.")
@@ -133,6 +118,67 @@ def download_zoom_recording(share_url: str, passcode: str | None, dest_path: str
                     total += len(chunk)
         if total < 10_000:
             raise RuntimeError("Zoom скачал слишком маленький файл (<10 КБ). Возможно, неверный пароль/доступ.")
+
+# ===== Google Drive большие файлы =====
+DRIVE_UC_RE = re.compile(r"^https?://drive\.google\.com/uc\?", re.I)
+
+def _drive_extract_id(url: str) -> str | None:
+    m = re.search(r"[?&]id=([^&]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"drive\.google\.com/.*/file/d/([^/]+)/", url)
+    if m:
+        return m.group(1)
+    return None
+
+def _drive_download_with_confirm(session: requests.Session, url: str, file_id: str, dest_path: str) -> None:
+    """
+    1) Первый запрос к uc?export=download&id=... — может вернуть HTML с предупреждением.
+    2) Ищем confirm-токен (в ссылке или cookies).
+    3) Повторяем запрос с confirm=... и стягиваем файл потоково.
+    """
+    # Первый запрос
+    resp = session.get(url, stream=True, timeout=300, allow_redirects=True)
+    cdisp = resp.headers.get("Content-Disposition")
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+
+    # Если сразу отдали файл (есть Content-Disposition и не text/html) — качаем
+    if (cdisp and "attachment" in cdisp.lower()) and ("html" not in ctype and not ctype.startswith("text/")):
+        with open(dest_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+        return
+
+    # Иначе это HTML-страница предупреждения. Ищем confirm
+    text = resp.text
+    # 1) confirm в ссылке
+    m = re.search(r'href="[^"]*?confirm=([0-9A-Za-z_\-]+)[^"]*?&id=' + re.escape(file_id), text)
+    token = m.group(1) if m else None
+    # 2) или в cookies
+    if not token:
+        for k, v in resp.cookies.items():
+            if k.startswith("download_warning"):
+                token = v
+                break
+    if not token:
+        raise RuntimeError("Google Drive требует подтверждение (confirm), токен не найден. Проверьте доступ и попробуйте снова.")
+
+    # Повторный запрос с confirm
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    qs["confirm"] = [token]
+    new_qs = urllib.parse.urlencode({k: v[0] for k, v in qs.items()})
+    url2 = urllib.parse.urlunparse(parsed._replace(query=new_qs))
+
+    resp2 = session.get(url2, stream=True, timeout=600, allow_redirects=True)
+    ctype2 = (resp2.headers.get("Content-Type") or "").lower()
+    if "html" in ctype2 or ctype2.startswith("text/"):
+        raise RuntimeError("Google Drive снова вернул HTML. Проверьте, открыт ли доступ по ссылке («Любой у кого есть ссылка»).")
+    with open(dest_path, "wb") as f:
+        for chunk in resp2.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
 
 def download_from_link(link: str, dest_path: str, maybe_passcode: str | None = None) -> None:
     link = normalize_link(link)
@@ -147,11 +193,24 @@ def download_from_link(link: str, dest_path: str, maybe_passcode: str | None = N
         download_zoom_recording(link, maybe_passcode, dest_path)
         return
 
+    # Google Drive (uc?export=download&id=...)
+    if "drive.google.com" in link:
+        file_id = _drive_extract_id(link)
+        if not file_id:
+            raise RuntimeError("Не удалось извлечь ID файла Google Drive. Пришлите обычную ссылку «Поделиться» на файл.")
+        uc_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+        _drive_download_with_confirm(session, uc_url, file_id, dest_path)
+        if os.path.getsize(dest_path) < 10_000:
+            raise RuntimeError("Google Drive отдал слишком маленький файл (<10 КБ). Проверьте доступ по ссылке.")
+        return
+
     # Обычные прямые ссылки
     headers = {"User-Agent": "Mozilla/5.0"}
     with requests.get(link, headers=headers, stream=True, timeout=300, allow_redirects=True) as r:
         ctype = (r.headers.get("Content-Type") or "").lower()
-        if "html" in ctype or "text/" in ctype:
+        if "html" in ctype or ctype.startswith("text/"):
             raise RuntimeError("Скачалась HTML-страница. Нужна ПРЯМАЯ ссылка на файл (или Nextcloud с /download).")
         total = 0
         with open(dest_path, "wb") as f:
@@ -283,7 +342,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     m = re.search(r"(https?://\S+)", text)
     if m:
         link = m.group(1)
-        passcode = extract_passcode(text)  # вытащим пароль, если прислан
+        passcode = extract_passcode(text)  # пароль для Zoom, если прислан
         await msg.reply_text("🌐 Скачиваю файл по ссылке…")
         with tempfile.TemporaryDirectory() as tmpdir:
             src = os.path.join(tmpdir, "download.bin")
@@ -329,7 +388,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # 3) Подсказка
-    await msg.reply_text("ℹ️ Пришлите аудио/видео вложением ИЛИ прямую ссылку (Google Drive/Nextcloud/Zoom + пароль).")
+    await msg.reply_text("ℹ️ Пришлите аудио/видео вложением ИЛИ ссылку (Google Drive/Nextcloud/Zoom+пароль).")
 
 # ===== ЗАПУСК =====
 def main():
